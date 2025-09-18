@@ -116,6 +116,10 @@ version = "0.1.0"
 source = "git+https://github.com/hikalium/wasabi.git?branch=for_saba#abf27c6f587e777fce5c53234d45d997ed075996"
 
 [[package]]
+name = "soba_core"
+version = "0.1.0"
+
+[[package]]
 name = "syn"
 version = "2.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
