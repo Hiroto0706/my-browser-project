@@ -3,5 +3,5 @@
 version = 3
 
 [[package]]
-name = "soba_core"
+name = "saba_core"
 version = "0.1.0"
