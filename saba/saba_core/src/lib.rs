@@ -40,6 +40,9 @@
 
 extern crate alloc; // no_std でも `String`/`Vec` を使うために必要
 
+pub mod browser;
 pub mod error; // 共有エラー型（Result<T, Error> 用）
 pub mod http; // HTTP の型/処理（I/Oは含まない）
-pub mod url; // URL ユーティリティ
+pub mod renderer; // HTMLレンダリング
+pub mod url;
+pub mod utils; // URL ユーティリティ

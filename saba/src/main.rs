@@ -1,50 +1,64 @@
-//! saba/bin — OS風(no_std)環境での最小エントリポイント
+//! saba/bin — no_std 環境での最小メイン（初心者向けコメント）
 //!
-//! 目的（概要）
-//! - 標準ライブラリなし（`no_std`）で動くアプリの“入口”です。
-//! - ネットワークI/Oはライブラリ側（`net_wasabi`）に任せ、ここでは呼び出して結果を表示します。
-//!
-//! 言語の橋渡し（TS/Python/Go）
-//! - `Result<T, E>` は try/catch(try/except) の結果。成功= `Ok(T)` / 失敗= `Err(E)`。
-//! - `to_string()` は借用文字列 `&str` → 所有文字列 `String` へ変換します。
-//!   - TS: `String(value)`、Python: `str(value)`、Go: `string(bytes)` に近い変換。
-//! - `entry_point!(main)` は“OS向けの起動点”を生成します。通常の `fn main(){}` とは別の仕組みです。
-//!
-//! 入出力（このファイル）
-//! - 入力: なし（OSから起動）
-//! - 出力: シリアル/コンソールにHTTPの結果を印字し、終了コード `u64` を返します。
+//! ここは“アプリの入口”。標準ライブラリを使わない no_std かつ OS 風の実行環境で動かします。
+//! - `no_std` により `std` の代わりに OS が提供する `noli` のAPIを使います。
+//! - サンプルとして、HTTPレスポンス相当の文字列を解析→DOM化→テキストで出力します。
+//! - TS/Python/Go の感覚: `Browser` は“ページ状態を持つクラス”、`to_string()` は `str(value)` 相当。
 #![no_std]
 #![no_main]
 
-extern crate alloc; // `String`/`Vec` 等のヒープ確保型を使うためのクレート（no_stdで必要）
+extern crate alloc; // ヒープ型（String/Vecなど）を使うためのクレート（no_std では明示）
 
-use crate::alloc::string::ToString; // `to_string()` を使うためのトレイト
-use net_wasabi::http::HttpClient;   // HTTPクライアント（TCPでGETを投げる最小実装）
-use noli::prelude::*;               // OS側が提供する `print!` などのユーティリティ
+use crate::alloc::string::ToString; // `&str` → `String` へ変換する `to_string()` を使うため
+use noli::*; // OS 環境側のプリリュード（println! など）
+use saba_core::browser::Browser; // ブラウザ本体（ページ/DOMの管理）
+use saba_core::http::HttpResponse; // HTTP レスポンス文字列のパース/保持
 
-// エントリ関数。戻り値 `u64` は“終了コード”のイメージです。
+// 簡易デモ用の“HTTPレスポンス風”文字列。
+// ポイント:
+// - ステータス行: HTTP/1.1 200 OK
+// - ヘッダ: Data（本来は Date など）
+// - 空行の後に HTML 本文
+static TEST_HTTP_RESPONSE: &str = r#"HTTP/1.1 200 OK
+Data: xx xx xx
+
+
+<html>
+<head></head>
+<body>
+  <h1 id="title">H1 title</h1>
+  <h2 class="class">H2 title</h2>
+  <p>Test text.</p>
+  <p>
+    <a href="example.com">Link1</a>
+    <a href="example.com">Link2</a>
+  </p>
+</body>
+</html>
+"#;
+
 fn main() -> u64 {
-    // 1) クライアントを作る。
-    //    Rustでは“コンストラクタ”として関連関数 `new()` をよく使います。
-    let client = HttpClient::new();
+    // 1) ブラウザインスタンスを用意（内側に“現在のページ”を持つ）
+    let browser = Browser::new();
 
-    // 2) HTTP GET を実行。
-    //    引数: (ホスト名, ポート番号, パス)。パスの先頭に `/` は付けない想定。
-    //    `&str` を `String` にするため `to_string()` を使っています。
-    match client.get("host.test".to_string(), 8000, "test.html".to_string()) {
-        Ok(res) => {
-            // 成功。`Ok(res)` の中身 `res` をデバッグ表示。
-            print!("response:\n{:#?}", res);
-        }
-        Err(e) => {
-            // 失敗。`Err(e)` のエラー内容を表示。
-            print!("error:\n{:#?}", e);
-        }
+    // 2) サンプルのHTTPレスポンス文字列を `HttpResponse` にパース
+    //    - `to_string()` は &str → String。エラー時は expect で失敗表示。
+    let response =
+        HttpResponse::new(TEST_HTTP_RESPONSE.to_string()).expect("failed to parse http response");
+
+    // 3) 現在のページにレスポンスを渡して DOM を構築し、描画用のテキストを受け取る
+    //    - `borrow()/borrow_mut()` は `RefCell` の可変/不変借用（内部可変）。
+    let page = browser.borrow().current_page();
+    let dom_string = page.borrow_mut().receive_response(response);
+
+    // 4) 1行ずつシリアルへ出力（OS側の println! を使用）
+    for log in dom_string.lines() {
+        println!("{}", log);
     }
-    // 3) 正常終了。
+
+    // 5) 終了コード 0（成功）
     0
 }
 
-// OS向けの“本当の”入口を生成するマクロ。
-// ブートローダ/ランタイムがここで生成された入口を呼び、上の `main()` に制御が渡ります。
+// OS向けの起動点を登録（no_main 環境で main を呼び出すためのマクロ）
 entry_point!(main);
