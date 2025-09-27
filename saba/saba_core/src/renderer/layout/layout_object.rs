@@ -2,6 +2,9 @@ use crate::alloc::string::ToString;
 use crate::constants::CHAR_HEIGHT_WITH_PADDING;
 use crate::constants::CHAR_WIDTH;
 use crate::constants::CONTENT_AREA_WIDTH;
+use crate::constants::WINDOW_PADDING;
+use crate::constants::WINDOW_WIDTH;
+use crate::display_item::DisplayItem;
 use crate::renderer::css::cssom::ComponentValue;
 use crate::renderer::css::cssom::Declaration;
 use crate::renderer::css::cssom::Selector;
@@ -14,8 +17,55 @@ use crate::renderer::layout::computed_style::DisplayType;
 use crate::renderer::layout::computed_style::FontSize;
 use alloc::rc::Rc;
 use alloc::rc::Weak;
+use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+
+/// 単語境界（スペース）での折り返し位置を、右から左へ探す
+/// 仕様（参考）: https://drafts.csswg.org/css-text/#word-break-property
+///
+/// 概要
+/// - 1 行に収めたい最大インデックス `max_index` から左へ向かって走査し、
+///   最初に見つかったスペースの位置を返します。
+/// - 見つからなければ `max_index` を返して、そこで強制的に折り返します。
+///
+/// 例: line="hello world", max_index=8 → 5（"hello| world" の '|' 位置）
+fn find_index_for_line_break(line: String, max_index: usize) -> usize {
+    for i in (0..max_index).rev() {
+        if line.chars().collect::<Vec<char>>()[i] == ' ' {
+            return i;
+        }
+    }
+    max_index
+}
+
+/// 等幅フォントの幅ベースで、テキストを複数行へ分割する（簡易ワードラップ）
+/// 仕様（参考）: https://drafts.csswg.org/css-text/#word-break-property
+///
+/// 概要
+/// - 各文字の見かけ幅を `char_width`（px）として、1行に収まる最大文字数を計算。
+/// - その範囲内で右端からスペースを探し、そこで改行。残りの文字列に対して再帰的に繰り返す。
+/// - スペースが見つからない（長い単語）場合は強制的に分割（簡易実装）。
+///
+/// 例
+/// - WINDOW_WIDTH=600, WINDOW_PADDING=5, char_width=8 のとき
+///   1行あたりの概算最大文字数 = (WINDOW_WIDTH + WINDOW_PADDING) / char_width
+///   line が長ければ "... ... ..." のスペース位置で折り返し、Vec<String> に分割結果を返す。
+fn split_text(line: String, char_width: i64) -> Vec<String> {
+    let mut result: Vec<String> = vec![];
+    if line.len() as i64 * char_width > (WINDOW_WIDTH + WINDOW_PADDING) {
+        let s = line.split_at(find_index_for_line_break(
+            line.clone(),
+            ((WINDOW_WIDTH + WINDOW_PADDING) / char_width) as usize,
+        ));
+        result.push(s.0.to_string());
+        result.extend(split_text(s.1.trim().to_string(), char_width))
+    } else {
+        result.push(line);
+    }
+    result
+}
 
 /// DOM ノードからレイアウトオブジェクト（描画用ノード）を1つ生成する
 ///
@@ -124,6 +174,88 @@ impl LayoutObject {
             point: LayoutPoint::new(0, 0),
             size: LayoutSize::new(0, 0),
         }
+    }
+
+    /// 自分自身に対応する描画命令（DisplayItem）を生成する
+    ///
+    /// ざっくりの方針（学習用）
+    /// - display:none のときは何も描かない（空ベクタ）
+    /// - Block 要素: 背景などの矩形（Rect）を 1 枚追加
+    /// - Inline 要素: 現時点では描かない（将来 `<img>` などをここで処理）
+    /// - Text ノード: テキストを折り返し単位で複数の Text DisplayItem に分割
+    ///
+    /// 具体例
+    /// - <p style="background-color:yellow">Hi</p>
+    ///   → Rect(bg=yellow, point=pの左上, size=pのサイズ)
+    ///   → Text("Hi", point=pの左上)
+    pub fn paint(&mut self) -> Vec<DisplayItem> {
+        if self.style.display() == DisplayType::DisplayNone {
+            return vec![];
+        }
+
+        match self.kind {
+            LayoutObjectKind::Block => {
+                // (d1)
+                // ブロック要素は背景（や枠線など）を塗る前提の最小モデル。
+                // ここでは常に 1 枚の Rect を返し、色や大きさは ComputedStyle/レイアウト結果に従う。
+                if let NodeKind::Element(_e) = self.node_kind() {
+                    return vec![DisplayItem::Rect {
+                        style: self.style(),
+                        layout_point: self.point(),
+                        layout_size: self.size(),
+                    }];
+                }
+            }
+            LayoutObjectKind::Inline => { // (d2)
+                 // 本書のブラウザでは、描画するインライン要素はない。
+                 // <img>タグなどをサポートした場合はこのアームの中で処理をする
+            }
+            LayoutObjectKind::Text => {
+                // (d3)
+                // テキストはフォントサイズ（ratio）と等幅フォント幅（CHAR_WIDTH）から
+                // 折り返し幅を計算し、行ごとに DisplayItem::Text を生成します。
+                // 例:
+                //   point=(x,y), ratio=1, CHAR_HEIGHT_WITH_PADDING=20, 行が3つ
+                //   → Text("line1", point=(x, y))
+                //   → Text("line2", point=(x, y+20))
+                //   → Text("line3", point=(x, y+40))
+                if let NodeKind::Text(t) = self.node_kind() {
+                    let mut v = vec![];
+
+                    let ratio = match self.style.font_size() {
+                        FontSize::Medium => 1,
+                        FontSize::XLarge => 2,
+                        FontSize::XXLarge => 3,
+                    };
+                    // 改行はスペースに置換し、連続スペースを 1 個に圧縮（見た目の乱れを抑える）
+                    let plain_text = t
+                        .replace("\n", " ")
+                        .split(' ')
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    // 1 行あたりに乗る最大幅（px）を与えてテキストを折り返す
+                    let lines = split_text(plain_text, CHAR_WIDTH * ratio);
+                    let mut i = 0;
+                    for line in lines {
+                        let item = DisplayItem::Text {
+                            text: line,
+                            style: self.style(),
+                            layout_point: LayoutPoint::new(
+                                self.point().x(),
+                                self.point().y() + CHAR_HEIGHT_WITH_PADDING * i,
+                            ),
+                        };
+                        v.push(item);
+                        i += 1;
+                    }
+
+                    return v;
+                }
+            }
+        }
+
+        vec![]
     }
 
     /// 子のサイズをもとに、このノードのレイアウトサイズ（幅・高さ）を計算する

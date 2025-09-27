@@ -16,6 +16,7 @@
 //! - display は block/inline/none のみ
 //! - テキストは等幅フォントで粗い見積り
 use crate::constants::CONTENT_AREA_WIDTH;
+use crate::display_item::DisplayItem;
 use crate::renderer::css::cssom::StyleSheet;
 use crate::renderer::dom::api::get_target_element_node;
 use crate::renderer::dom::node::ElementKind;
@@ -26,6 +27,7 @@ use crate::renderer::layout::layout_object::LayoutObjectKind;
 use crate::renderer::layout::layout_object::LayoutPoint;
 use crate::renderer::layout::layout_object::LayoutSize;
 use alloc::rc::Rc;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 
 // DOM ツリー → レイアウトツリー（描画対象のみ）を組み立てる
@@ -246,6 +248,52 @@ impl LayoutView {
             None,
             None,
         );
+    }
+
+    // レイアウトツリーを前順（自分→子→兄弟）にたどり、描画命令（DisplayItem）を集める
+    //
+    // 役割
+    // - 各 LayoutObject に対し `paint()` を呼び、矩形塗り・文字描画などの DisplayItem を収集します。
+    // - その後、子→兄弟の順に再帰して、最終的に“描画命令のリスト”を返せるようにします。
+    //
+    // 具体例
+    // - <body><p>text</p></body> の場合:
+    //   1) body.paint() → 背景などの DisplayItem を push
+    //   2) p.paint()    → 段落の背景や枠などを push
+    //   3) text.paint() → 文字列 "text" を描く命令を push
+    //   4) p の兄弟が無ければ body の兄弟へ、無ければ終了
+    fn paint_node(node: &Option<Rc<RefCell<LayoutObject>>>, display_items: &mut Vec<DisplayItem>) {
+        match node {
+            Some(n) => {
+                // 1) 自分自身の描画命令を収集
+                display_items.extend(n.borrow_mut().paint());
+
+                // 2) 子を先に描画（前順）
+                let first_child = n.borrow().first_child();
+                Self::paint_node(&first_child, display_items);
+
+                // 3) 兄弟を描画
+                let next_sibling = n.borrow().next_sibling();
+                Self::paint_node(&next_sibling, display_items);
+            }
+            None => (),
+        }
+    }
+
+    /// レイアウトツリー全体を描画命令列（DisplayItem の配列）へ変換する
+    ///
+    /// 概要
+    /// - ルートから前順にたどり、各ノードの `paint()` が返す DisplayItem を順に集めます。
+    /// - 返り値のベクタは、後段のラスタライズ/合成ステージに渡して画面に反映させます。
+    ///
+    /// 例
+    /// - <p>Hi</p> → [Rect(.. 背景 ..), Text(.. "Hi" ..)] のような命令が並ぶ想定。
+    pub fn paint(&self) -> Vec<DisplayItem> {
+        let mut display_items = Vec::new();
+
+        Self::paint_node(&self.root, &mut display_items);
+
+        display_items
     }
 
     /// レイアウトツリーのルート（描画される最上位の LayoutObject）を返す

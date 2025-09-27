@@ -2,7 +2,8 @@
 //!
 //! ここは“アプリの入口”。標準ライブラリを使わない no_std かつ OS 風の実行環境で動かします。
 //! - `no_std` により `std` の代わりに OS が提供する `noli` のAPIを使います。
-//! - サンプルとして、HTTPレスポンス相当の文字列を解析→DOM化→テキストで出力します。
+//! - サンプルとして、HTTPレスポンス相当の文字列を解析→DOM/CSSOM化→（内部で）レイアウト/描画準備まで行います。
+//!   ここでは画面出力は行わず、パイプラインの入口とデータフローの最小例に留めます。
 //! - TS/Python/Go の感覚: `Browser` は“ページ状態を持つクラス”、`to_string()` は `str(value)` 相当。
 #![no_std]
 #![no_main]
@@ -46,17 +47,15 @@ fn main() -> u64 {
     let response =
         HttpResponse::new(TEST_HTTP_RESPONSE.to_string()).expect("failed to parse http response");
 
-    // 3) 現在のページにレスポンスを渡して DOM を構築し、描画用のテキストを受け取る
-    //    - `borrow()/borrow_mut()` は `RefCell` の可変/不変借用（内部可変）。
+    // 3) 現在のページへレスポンスを渡し、DOM/CSSOM の構築（以降のレイアウト/描画準備）を行う
+    //    - `borrow()/borrow_mut()` は `RefCell` の可変/不変借用（内部可変）
+    //    - 具体的には: HTML → DOM、<style> → CSSOM、レイアウトツリー作成・サイズ/位置計算・
+    //      DisplayItem 生成、といった処理をページ内で進める設計（最小版）
     let page = browser.borrow().current_page();
-    let dom_string = page.borrow_mut().receive_response(response);
+    page.borrow_mut().receive_response(response);
 
-    // 4) 1行ずつシリアルへ出力（OS側の println! を使用）
-    for log in dom_string.lines() {
-        println!("{}", log);
-    }
+    // 4) 今は画面描画やログ出力は行わず、正常終了コードを返すだけ
 
-    // 5) 終了コード 0（成功）
     0
 }
 
