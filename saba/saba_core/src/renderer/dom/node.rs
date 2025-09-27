@@ -31,6 +31,8 @@ use alloc::rc::Weak;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::fmt::Display;
+use core::fmt::Formatter;
 use core::str::FromStr;
 
 #[derive(Debug, Clone)]
@@ -208,6 +210,18 @@ impl Element {
     pub fn kind(&self) -> ElementKind {
         self.kind
     }
+
+    pub fn attributes(&self) -> Vec<Attribute> {
+        self.attributes.clone()
+    }
+
+    // 要素がデフォルトでブロック要素かインライン要素か決める
+    pub fn is_block_element(&self) -> bool {
+        match self.kind {
+            ElementKind::Body | ElementKind::H1 | ElementKind::H2 | ElementKind::P => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -232,10 +246,38 @@ pub enum ElementKind {
     A,
 }
 
+// ElementKind ↔ タグ名（文字列）の相互変換ヘルパー
+//
+// - Display 実装: ElementKind → "html" / "body" などのタグ名へ
+//   例: format!("{}", ElementKind::P) == "p"
+// - FromStr 実装: "html" / "body" などのタグ名 → ElementKind へ
+//   例: ElementKind::from_str("h1") == Ok(ElementKind::H1)
+//
+// これにより、DOM API 側で「列挙型と文字列」を簡単に相互運用できます。
+impl Display for ElementKind {
+    fn fmt(&self, f: &mut Formatter) -> core::fmt::Result {
+        // 列挙子ごとに対応するタグ名（小文字）を返す
+        let s = match self {
+            ElementKind::Html => "html",
+            ElementKind::Head => "head",
+            ElementKind::Style => "style",
+            ElementKind::Script => "script",
+            ElementKind::Body => "body",
+            ElementKind::H1 => "h1",
+            ElementKind::H2 => "h2",
+            ElementKind::P => "p",
+            ElementKind::A => "a",
+        };
+        write!(f, "{}", s) // 実体は単純な文字列の書き出し
+    }
+}
+
 impl FromStr for ElementKind {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // 小文字のタグ名文字列から ElementKind を得る
+        // 注意: ここでは対応している要素のみサポート（未実装は Err を返す）
         match s {
             "html" => Ok(ElementKind::Html),
             "head" => Ok(ElementKind::Head),
@@ -246,7 +288,7 @@ impl FromStr for ElementKind {
             "h1" => Ok(ElementKind::H1),
             "h2" => Ok(ElementKind::H2),
             "a" => Ok(ElementKind::A),
-            _ => Err(format!("unimplemented element name {:?}", s)),
+            _ => Err(format!("unimplemented element name {:?}", s)), // 対応外タグ（学習用の簡易実装）
         }
     }
 }
