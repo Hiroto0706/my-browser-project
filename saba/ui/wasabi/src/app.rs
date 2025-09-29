@@ -19,8 +19,11 @@ use saba_core::constants::WINDOW_INIT_X_POS;
 use saba_core::constants::WINDOW_INIT_Y_POS;
 use saba_core::constants::WINDOW_WIDTH;
 use saba_core::constants::*;
+use saba_core::display_item::DisplayItem;
 use saba_core::error::Error;
 use saba_core::http::HttpResponse;
+use saba_core::renderer::layout::computed_style::FontSize;
+use saba_core::renderer::layout::computed_style::TextDecoration;
 
 // 状態がNormalの時は入力ができず、Editingの時は文字入力ができる
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,8 +246,88 @@ impl WasabiUI {
             }
         }
 
-        // // 4) UI 全体を最新状態へ（必要範囲のフラッシュなどを行う）
-        // self.update_ui()?;
+        // 4) UI 全体を最新状態へ（必要範囲のフラッシュなどを行う）
+        self.update_ui()?;
+
+        Ok(())
+    }
+
+    /// ブラウザの「表示リスト」を画面に描く（テキスト/矩形）
+    ///
+    /// 仕組み（初心者向け）
+    /// - `display_items()` は「何をどこにどう描くか」の並び（Display List）。
+    ///   Web ブラウザのレイアウト後の出力に近い概念で、最終的な描画指示です。
+    /// - 各 `DisplayItem` を `draw_string` や `fill_rect` に落として実際のウィンドウへ描きます。
+    /// - 座標は「コンテンツ左上」を基準に計算しつつ、`WINDOW_PADDING` と `TOOLBAR_HEIGHT` を
+    ///   加算してウィンドウ内の実座標へずらします（余白とツールバー分のオフセット）。
+    /// - 最後に `flush()` でバッファの内容を画面へ反映します（部分でなく全体フラッシュ）。
+    ///
+    /// TS/Python たとえ
+    /// - `DisplayItem::Text { ... }` は TS の判別可能ユニオンに似ています（`kind === "Text"`）。
+    /// - `match` は `switch` より型安全な分岐。全バリアントを網羅しないとコンパイル警告が出ます。
+    fn update_ui(&mut self) -> Result<(), Error> {
+        let display_items = self
+            .browser
+            .borrow()
+            .current_page()
+            .borrow()
+            .display_items();
+
+        for item in display_items {
+            match item {
+                DisplayItem::Text {
+                    text,
+                    style,
+                    layout_point,
+                } => {
+                    // テキストを描く
+                    // - 色: `style.color()`（CSS 的な色）→ `code_u32()` で 0xRRGGBB へ
+                    // - 座標: レイアウト済みの点 + 余白 + ツールバー高
+                    // - フォント: レンダラーの `FontSize` → `convert_font_size` で描画 API の段階へ
+                    // - 下線: `text_decoration` が Underline のとき true
+                    if self
+                        .window
+                        .draw_string(
+                            style.color().code_u32(),
+                            layout_point.x() + WINDOW_PADDING,
+                            layout_point.y() + WINDOW_PADDING + TOOLBAR_HEIGHT,
+                            &text,
+                            convert_font_size(style.font_size()),
+                            style.text_decoration() == TextDecoration::Underline,
+                        )
+                        .is_err()
+                    {
+                        return Err(Error::InvalidUI("failed to draw a string".to_string()));
+                    }
+                }
+                DisplayItem::Rect {
+                    style,
+                    layout_point,
+                    layout_size,
+                } => {
+                    // 塗りつぶし矩形を描く（背景など）
+                    // - 色: `background_color`
+                    // - 位置とサイズ: レイアウトの結果 + 余白/ツールバー分のオフセット
+                    if self
+                        .window
+                        .fill_rect(
+                            style.background_color().code_u32(),
+                            layout_point.x() + WINDOW_PADDING,
+                            layout_point.y() + WINDOW_PADDING + TOOLBAR_HEIGHT,
+                            layout_size.width(),
+                            layout_size.height(),
+                        )
+                        .is_err()
+                    {
+                        return Err(Error::InvalidUI("failed to draw a string".to_string()));
+                    }
+                }
+            }
+        }
+
+        // 最後にまとめて画面へ反映。多くの `draw_*` はバッファに描くだけなので、
+        // `flush()` しないと実画面に見えません。
+        self.window.flush();
 
         Ok(())
     }
@@ -445,5 +528,33 @@ impl WasabiUI {
         self.window.flush();
 
         Ok(())
+    }
+}
+
+/// レイアウト層のフォントサイズ（`FontSize`）を、描画ライブラリのサイズ（`StringSize`）へ変換する
+///
+/// 背景
+/// - `FontSize` はレンダラー側（`saba_core`）の論理サイズ。CSS の `font-size` のような概念。
+/// - `StringSize` は描画 API（`noli::window`）がサポートする実サイズの列挙。
+///   名称と段階が完全一致しないため、最も近い段階へ丸めます。
+///
+/// 変換ルール（現在の対応）
+/// - `Medium`  → `Medium`
+/// - `XLarge`  → `Large`   （名前は異なるが実寸が近い）
+/// - `XXLarge` → `XLarge`
+///
+/// メモ
+/// - 列挙型（Rust の enum ≈ TS の union 型）なので、将来 `FontSize` に新しい値が増えたら、
+///   ここでどの `StringSize` に落とすか決める必要があります（未対応だとコンパイルエラーで気づけます）。
+///
+/// 使用例
+/// ```rust
+/// let s = convert_font_size(FontSize::XLarge); // => StringSize::Large
+/// ```
+fn convert_font_size(size: FontSize) -> StringSize {
+    match size {
+        FontSize::Medium => StringSize::Medium,
+        FontSize::XLarge => StringSize::Large,
+        FontSize::XXLarge => StringSize::XLarge,
     }
 }
