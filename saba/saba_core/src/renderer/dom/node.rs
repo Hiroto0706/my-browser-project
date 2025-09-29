@@ -4,6 +4,8 @@
 //! - 実際のブラウザでは、HTML をパースすると「ノードの木構造（DOM ツリー）」が作られます。
 //! - このファイルでは、その最小構成として `Window`（最上位のグローバル）→`Document`→
 //!   `Element`/`Text` という階層を `Node` で表現しています。
+//! - `Element` はタグ種別（`ElementKind`）と属性（`attributes: Vec<Attribute>`）を持ち、
+//!   `get_attribute("href")` のように属性値を取り出せます（学習用の簡易実装）。
 //! - 兄弟/親子リンクを持つ「双方向の木」を、Rust の `Rc<RefCell<...>>` と `Weak` を使って実現します。
 //!
 //! 言語ブリッジ（TS / Python / Go）
@@ -18,6 +20,13 @@
 //! let doc = win.document();                // Rc<RefCell<Node>>
 //! // ここでパーサが作る想定: Document の下に Element(p) と Text("Hello") をぶら下げる …
 //! // 本ファイルは木の型・リンクを提供し、パース・レンダリング層がこの構造を操作します。
+//! ```
+//! 属性の取得例（<a href="/next">link</a>）
+//! ```ignore
+//! if let Some(Element(e)) = &doc.borrow().first_child().unwrap().borrow().kind() { /* 概念図 */ }
+//! // 実際にはパーサが Element を作り、以下のように参照できます:
+//! let a: Element = /* <a href=...> を指す要素 */;
+//! assert_eq!(a.get_attribute("href"), Some("/next".to_string()));
 //! ```
 //! ブラウザ挙動での役割
 //! - パース後: DOM ツリー（この Node 構造体群）が完成。
@@ -211,8 +220,31 @@ impl Element {
         self.kind
     }
 
+    /// この要素が持つ全属性を返す（順序は保持）
+    ///
+    /// メモ
+    /// - ここでは `Vec<Attribute>` をそのまま複製して返します（学習用の単純実装）。
+    /// - 実ブラウザでは属性マップの正規化や大小文字の扱い、名前空間等が絡みます。
     pub fn attributes(&self) -> Vec<Attribute> {
         self.attributes.clone()
+    }
+
+    /// 属性 `name` の値を返す（存在しなければ `None`）
+    ///
+    /// 使い方
+    /// - `<a href="/next">` に対して `get_attribute("href")` → `Some("/next".to_string())`
+    /// - 見つからない場合は `None`
+    ///
+    /// 注意（簡易実装）
+    /// - 名前比較は完全一致（大文字小文字の正規化はしません）。HTML 的には小文字想定です。
+    /// - 重複属性は想定しません。最初に見つかった 1 件を返します。
+    pub fn get_attribute(&self, name: &str) -> Option<String> {
+        for attr in &self.attributes {
+            if attr.name() == name {
+                return Some(attr.value());
+            }
+        }
+        None
     }
 
     // 要素がデフォルトでブロック要素かインライン要素か決める

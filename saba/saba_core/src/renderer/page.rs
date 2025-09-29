@@ -7,6 +7,11 @@
 //!   さらに <style> から CSSOM を作り、レイアウト（ツリー構築→サイズ→位置）まで進めます。
 //! - 最後に描画命令（DisplayItem）を得て、描画バックエンドに渡せる状態にします。
 //!
+//! クリック判定（ヒットテスト）
+//! - レイアウト済みツリーを使い、画面上の座標 (x,y) から「どのノード上か」を逆引きします。
+//! - `clicked((x,y))` がその入口で、もし `<a href="…">` をクリックしていれば `Some(url)` を返します。
+//! - 座標系は「コンテンツ左上が (0,0)」。ウィンドウのツールバー/余白分は呼び出し側で差し引きます。
+//!
 //! 言語ブリッジ（TS / Python / Go）
 //! - `Rc<RefCell<T>>`/`Weak<T>` は「共有 + 内部可変 / 循環参照回避」。
 //! - `receive_response` は“ページがネットワーク応答を受け取り、DOM/CSSOM→レイアウト→描画命令”へ進める入口メソッド。
@@ -27,6 +32,8 @@ use crate::renderer::css::cssom::CssParser;
 use crate::renderer::css::cssom::StyleSheet;
 use crate::renderer::css::token::CssTokenizer;
 use crate::renderer::dom::api::get_style_content;
+use crate::renderer::dom::node::ElementKind;
+use crate::renderer::dom::node::NodeKind;
 use crate::renderer::dom::node::Window;
 use crate::renderer::html::parser::HtmlParser;
 use crate::renderer::html::token::HtmlTokenizer;
@@ -56,6 +63,38 @@ impl Page {
             layout_view: None,
             display_items: Vec::new(),
         }
+    }
+
+    /// 座標 `(x,y)` にある要素をヒットテストし、リンクなら `href` を返す
+    ///
+    /// 入力
+    /// - `position`: コンテンツ領域基準の座標（左上が 0,0）。
+    ///   例: UI 側で `y - TITLE_BAR_HEIGHT - TOOLBAR_HEIGHT` のように補正します。
+    ///
+    /// 出力
+    /// - `Some(url)`: クリック位置が `<a href="…">`（または直下のテキスト）の場合、その URL。
+    /// - `None`: リンクでない、またはレイアウト未生成などで見つからない場合。
+    ///
+    /// 実装の概要
+    /// - `layout_view.find_node_by_position(position)` で、座標に重なるレイアウトノードを取得。
+    /// - 見つかったノードの親が `<a>` 要素なら `href` 属性を返す（簡易版。祖先すべては辿らない）。
+    pub fn clicked(&self, position: (i64, i64)) -> Option<String> {
+        let view = match &self.layout_view {
+            Some(v) => v,
+            None => return None,
+        };
+
+        if let Some(n) = view.find_node_by_position(position) {
+            if let Some(parent) = n.borrow().parent().upgrade() {
+                if let NodeKind::Element(e) = parent.borrow().node_kind() {
+                    if e.kind() == ElementKind::A {
+                        return e.get_attribute("href");
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     // 所属ブラウザを弱参照でセット（循環参照回避）。

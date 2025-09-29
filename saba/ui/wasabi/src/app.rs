@@ -91,25 +91,33 @@ impl WasabiUI {
     ) -> Result<(), Error> {
         loop {
             // マウスイベント（クリック/ドラッグ/スクロール 等）の処理
-            self.handle_mouse_input()?;
+            self.handle_mouse_input(handle_url)?;
             // キーイベント（文字入力/Enter/Esc 等）の処理
             self.handle_key_input(handle_url)?;
         }
     }
 
-    /// マウス入力を処理する（カーソルの表示更新とクリック判定）
+    /// マウス入力を処理する（カーソル更新・クリックでのモード切替・リンク遷移）
     ///
     /// 何をしているか（初心者向け）
     /// - `Api::get_mouse_cursor_info()` から「ボタン状態 + 位置」を取得。
-    /// - カーソル（赤い 10x10 のシート）の位置を更新 → 部分フラッシュで描画を反映。
-    /// - クリックがあれば、座標をウィンドウ左上基準の「相対座標」に変換して範囲判定。
-    ///   - ツールバー帯をクリック: 入力モード `Editing` に切り替え、アドレスバーをクリア。
+    /// - カーソル（赤い 10x10 のシート）の位置を更新 → `flush_area` で部分反映。
+    /// - クリック時はウィンドウ左上基準の相対座標を計算して範囲判定。
+    ///   - ツールバー帯: 入力モードを `Editing` にし、アドレスバーをクリア。
+    ///   - コンテンツ領域: レイアウトに「どの要素をクリックしたか」を問い合わせ、
+    ///     もしリンク先 URL が得られたら、アドレスバーを更新して `start_navigation(handle_url, url)` を呼ぶ。
     ///   - それ以外: 入力モードを `Normal` に戻す。
+    ///
+    /// 引数
+    /// - `handle_url` … 取得処理を行うコールバック（`start_navigation` に渡します）。
     ///
     /// 補足（TS/Python 的たとえ）
     /// - `if let Some(e) = get_event()` は「イベントがあれば処理、なければスキップ」のパターン。
     /// - 画面更新は「バッファ→画面」の二段階。`flush_area(rect)` は部分コミット。
-    fn handle_mouse_input(&mut self) -> Result<(), Error> {
+    fn handle_mouse_input(
+        &mut self,
+        handle_url: fn(String) -> Result<HttpResponse, Error>,
+    ) -> Result<(), Error> {
         // 最新のマウス情報を取得（イベントが無いフレームは None）
         if let Some(MouseEvent { button, position }) = Api::get_mouse_cursor_info() {
             // 1) 直前のカーソル描画領域を部分フラッシュして掃除（前の位置の残像を消す）
@@ -153,6 +161,27 @@ impl WasabiUI {
 
                 // ツールバー以外をクリックしたので通常モードへ戻す
                 self.input_mode = InputMode::Normal;
+
+                // コンテンツ領域内での座標に変換（タイトルバー/ツールバー分を引く）
+                // - レイアウトはコンテンツ左上(0,0)基準で計算されているため、
+                //   その基準に合わせることで「どの要素の上か」を判断できるようにします。
+                let position_in_content_area = (
+                    relative_pos.0,
+                    relative_pos.1 - TITLE_BAR_HEIGHT - TOOLBAR_HEIGHT,
+                );
+                // 現在のページモデルに「この座標は何をクリックしたか？」を問い合わせる
+                // - `clicked((x,y)) -> Option<String>` を想定。リンクであれば URL を返す。
+                // - `Rc<RefCell<_>>` 越しに可変借用しているのは、ページ内部の状態更新（ハイライト等）に備えるため。
+                let page = self.browser.borrow().current_page();
+                let next_destination = page.borrow_mut().clicked(position_in_content_area);
+
+                if let Some(url) = next_destination {
+                    // クリックしたリンクの URL をアドレスバーへ反映（視覚的に分かりやすく）
+                    self.input_url = url.clone();
+                    self.update_address_bar()?;
+                    // そして実際に遷移を開始（HTTP 取得 → ページ適用 → 再描画）
+                    self.start_navigation(handle_url, url)?;
+                }
             }
         }
 
