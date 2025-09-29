@@ -11,6 +11,11 @@
 //! 2) 各ノードのサイズを自前ルールで算出（calculate_node_size → compute_size）
 //! 3) 各ノードの位置（左上座標）を決定（calculate_node_position → compute_position）
 //!
+//! ヒットテスト（クリック判定）
+//! - 画面座標（コンテンツ左上を原点）から、どのレイアウトノードの範囲にあるかを逆引きできます。
+//! - `find_node_by_position((x,y))` がエントリで、内部では DFS（子優先）で矩形当たり判定を行います。
+//! - UI 側ではツールバーやウィンドウ余白を引いた“コンテンツ座標”に変換してから呼びます。
+//!
 //! 制約（学習用の簡易化）
 //! - 行折り返しや margin/padding/border、line-height 等の厳密処理は省略
 //! - display は block/inline/none のみ
@@ -163,6 +168,64 @@ impl LayoutView {
         tree.update_layout();
 
         tree
+    }
+
+    /// 画面上の座標 `(x,y)` にあるレイアウトノードを返す（子優先のヒットテスト）
+    ///
+    /// 入力
+    /// - `position`: コンテンツ領域基準の座標（左上が 0,0）。UI 側でツールバー分を除去してください。
+    ///
+    /// 返り値
+    /// - `Some(Rc<LayoutObject>)` … クリック位置を包含する最も内側のノード（子優先で探索）。
+    /// - `None` … どのノードにも当たらない場合。
+    ///
+    /// 実装メモ
+    /// - 内部の `find_node_by_position_internal` は子 → 兄弟 → 自身の順に判定することで、
+    ///   より内側のノードを優先して返します（一般的なブラウザのヒットテストに近い挙動）。
+    pub fn find_node_by_position(&self, position: (i64, i64)) -> Option<Rc<RefCell<LayoutObject>>> {
+        Self::find_node_by_position_internal(&self.root(), position)
+    }
+
+    /// DFS でレイアウトツリーをたどり、矩形当たり判定でノードを見つける内部関数
+    ///
+    /// アルゴリズム（子優先）
+    /// 1) まず子を調べる（より細かい要素を優先）
+    /// 2) 次に兄弟を調べる（同じ階層の別要素）
+    /// 3) それでも無ければ自分自身の矩形にヒットするか判定
+    ///
+    /// 備考
+    /// - ノードの矩形は `point(): LayoutPoint`（左上）と `size(): LayoutSize`（幅・高さ）で表現。
+    /// - 座標系はこの `LayoutView` で計算したコンテンツ座標と一致します。
+    fn find_node_by_position_internal(
+        node: &Option<Rc<RefCell<LayoutObject>>>,
+        position: (i64, i64),
+    ) -> Option<Rc<RefCell<LayoutObject>>> {
+        match node {
+            Some(n) => {
+                let first_child = n.borrow().first_child();
+                let result1 = Self::find_node_by_position_internal(&first_child, position);
+                if result1.is_some() {
+                    return result1;
+                }
+
+                let next_sibling = n.borrow().next_sibling();
+                let result2 = Self::find_node_by_position_internal(&next_sibling, position);
+                if result2.is_some() {
+                    return result2;
+                }
+
+                // 最後に、自分自身の外接矩形に当たっているかを判定
+                if n.borrow().point().x() <= position.0
+                    && position.0 <= (n.borrow().point().x() + n.borrow().size().width())
+                    && n.borrow().point().y() <= position.1
+                    && position.1 <= (n.borrow().point().y() + n.borrow().size().height())
+                {
+                    return Some(n.clone());
+                }
+                None
+            }
+            None => None,
+        }
     }
 
     // レイアウトツリーのノードの位置を再起的に計算する関数
