@@ -1,45 +1,48 @@
-//! saba_core::renderer::js::ast — 超最小 AST（抽象構文木）とパーサ（初心者向け）
+//! saba_core::renderer::js::ast — 最小構成の JavaScript 風 AST とパーサ
 //!
 //! 目的
-//! - JavaScript 風の“ごく一部”の構文を AST に変換します。
-//! - サポートするのは数値リテラル、`+`/`-` の加算式、式文（末尾の `;` は任意）。
-//! - 仕様準拠ではなく学習用に大幅簡略化しています。
+//! - JavaScript 風の基本的な構文を抽象構文木（AST）へ変換します。
+//! - 文の並び（`Program`）と、式・宣言（`Node`）をシンプルな形で表現します。
 //!
-//! 簡易文法（イメージ）
-//! - `Program      → Statement*`
-//! - `Statement    → Expression ';'?`  （`;` はあってもなくても可）
-//! - `Expression   → AdditiveExpression`
-//! - `Additive     → Primary (('+'|'-') Additive)?` 右再帰（学習用の簡易実装）
-//! - `Primary      → Number`
+//! 文法スケッチ（学習向けに読みやすく）
+//! - `Program        → Statement*`
+//! - `Statement      → VariableDeclaration ';'? | ReturnStatement ';'? | ExpressionStatement ';'?`
+//! - `Expression     → AssignmentExpression`
+//! - `Assignment     → LeftHandSide '=' AssignmentExpression | AdditiveExpression`
+//! - `Additive       → LeftHandSide (('+'|'-') AssignmentExpression)?`
+//! - `LeftHandSide   → MemberExpression`
+//! - `Member         → Primary`
+//! - `Primary        → Identifier | StringLiteral | NumericLiteral`
 //!
-//! 型と用語の橋渡し（TS / Python）
-//! - Rust の `trait` ≈ TS の interface / Python の protocol。
-//! - `Result<T, E>` ≈ `try/except` の結果。`?` は `await`/`raise` 風の伝播。
-//! - 所有権/借用: `Rc<Node>` は“参照カウント付き共有ポインタ”。TS/Python の参照渡しに近い。
-//! - AST 形状は ESTree の用語をゆるく取り入れています（`ExpressionStatement` など）。
+//! 型ブリッジ（TS / Python の感覚）
+//! - `Node::VariableDeclaration/VariableDeclarator/Identifier/StringLiteral/NumericLiteral` などは
+//!   ESTree の用語と概念的に対応します。
+//! - `Program { body: Vec<Rc<Node>> }` は TS の `Program { body: Node[] }`／Python の `ast.Module(body)` に相当。
+//! - 共有には `Rc<Node>` を使います（所有権の移動なしで参照共有）。
 //!
-//! 使い方（イメージ）
-//! ```rust,ignore
-//! use saba_core::renderer::js::token::JsLexer;
-//! use saba_core::renderer::js::ast::JsParser;
-//! let input = "1 + 2;".to_string();
-//! let lexer = JsLexer::new(input);
-//! let mut parser = JsParser::new(lexer);
-//! let program = parser.parse_ast(); // Program { body: [ExpressionStatement(AdditiveExpression(...))] }
-//! ```
-//!
-//! 注意
-//! - エラーハンドリングは最小で、未対応のトークンに遭遇すると途中までの結果を返すことがあります。
-//! - 実運用のパーサでは `Result<..>` とエラー情報（位置など）を返す設計が一般的です。
-//! - `no_std` 環境のため、動的確保は `alloc` クレート（`Rc`, `Vec`, `String` 等）に依存します。
+//! 環境メモ
+//! - `no_std` 前提のため、`alloc` クレート（`Rc`, `Vec`, `String` 等）を利用します。
 
 use crate::renderer::js::token::JsLexer;
 use crate::renderer::js::token::Token;
 use alloc::rc::Rc;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::iter::Peekable;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// ESTree 風のノード種類（学習用に大幅簡略化）
+///
+/// ざっくり対応関係（TS/Python イメージ）
+/// - `ExpressionStatement(expr)`  … `type: 'ExpressionStatement'` / Python の `ast.Expr`
+/// - `AdditiveExpression{..}`    … `BinaryExpression`(operator: '+'|'-') / `ast.BinOp`
+/// - `AssignmentExpression{..}`  … `AssignmentExpression` / `ast.Assign`
+/// - `MemberExpression{..}`      … `MemberExpression` / `ast.Attribute`
+/// - `NumericLiteral(n)`         … `Literal<number>` / `ast.Constant`
+/// - `VariableDeclaration{..}`   … `VariableDeclaration(kind: 'var')`
+/// - `VariableDeclarator{..}`    … `VariableDeclarator(id, init)`
+/// - `Identifier(name)`          … `Identifier`
+/// - `StringLiteral(value)`      … `Literal<string>`
 pub enum Node {
     /// `expr;` の形の文。ここでは式しか扱わないため、単純に式を包むだけです。
     /// - TS の `ExpressionStatement { expression: Node }` に相当。
@@ -56,22 +59,39 @@ pub enum Node {
         right: Option<Rc<Node>>,
     },
 
-    /// 代入式（将来拡張のプレースホルダ）。現時点では実装未満で、
-    /// `assignment_expression()` は単に `additive_expression()` を呼び出します。
+    /// 代入式。
     AssignmentExpression {
         operator: char,
         left: Option<Rc<Node>>,
         right: Option<Rc<Node>>,
     },
 
-    /// メンバアクセス（`obj.prop` 等）のプレースホルダ。今は Primary をそのまま返します。
+    /// メンバアクセス（`obj.prop` 等）。
     MemberExpression {
         object: Option<Rc<Node>>,
         property: Option<Rc<Node>>,
     },
 
-    /// 数値リテラル。`u64` の範囲で扱います（負数や浮動小数は未対応）。
+    /// 数値リテラル。`u64` を保持します。
     NumericLiteral(u64),
+
+    /// 変数宣言。学習用に `var` のみ想定し、`declarations` の列を持ちます。
+    /// - 例: `var a = 1, b;` → `VariableDeclaration { declarations: [VarDecl(a=1), VarDecl(b=None)] }`
+    /// - 厳密には `kind: 'var'|'let'|'const'` などを持ちますが簡略化しています。
+    VariableDeclaration { declarations: Vec<Option<Rc<Node>>> },
+
+    /// 単一の宣言子。名前（`id`）と初期化子（`init`）のペア。
+    /// - 例: `var a = 1;` → `VariableDeclarator { id: Identifier("a"), init: NumericLiteral(1) }`
+    VariableDeclarator {
+        id: Option<Rc<Node>>,
+        init: Option<Rc<Node>>,
+    },
+
+    /// 識別子。変数名や関数名などのシンボル名を表します。例: `Identifier("foo")`
+    Identifier(String),
+
+    /// 文字列リテラル。二重引用符で囲まれた文字列の内容。例: `StringLiteral("bar")`
+    StringLiteral(String),
 }
 
 impl Node {
@@ -93,7 +113,7 @@ impl Node {
         }))
     }
 
-    /// `AssignmentExpression` を作成します（現状は未使用の将来拡張）。
+    /// `AssignmentExpression` を作成します。
     pub fn new_assignment_expression(
         operator: char,
         left: Option<Rc<Node>>,
@@ -106,7 +126,7 @@ impl Node {
         }))
     }
 
-    /// `MemberExpression` を作成します（現状は未使用の将来拡張）。
+    /// `MemberExpression` を作成します。
     pub fn new_member_expression(
         object: Option<Rc<Self>>,
         property: Option<Rc<Self>>,
@@ -117,6 +137,45 @@ impl Node {
     /// 数値リテラルを作成します。
     pub fn new_numeric_literal(value: u64) -> Option<Rc<Self>> {
         Some(Rc::new(Node::NumericLiteral(value)))
+    }
+
+    /// 単一の宣言子（`VariableDeclarator`）を作ります。
+    ///
+    /// 例
+    /// - `var a = 1;` → `new_variable_declarator(Identifier("a"), NumericLiteral(1))`
+    /// - `var b;`     → `new_variable_declarator(Identifier("b"), None)`（初期化子なし）
+    ///
+    /// 補足（TS/Python）
+    /// - TS: `{ id: Identifier, init?: Expression }`
+    /// - Python: `ast.Assign(targets=[Name("a")], value=Constant(1))` に相当（かなり簡略化）
+    pub fn new_variable_declarator(
+        id: Option<Rc<Self>>,
+        init: Option<Rc<Self>>,
+    ) -> Option<Rc<Self>> {
+        Some(Rc::new(Node::VariableDeclarator { id, init }))
+    }
+
+    /// 複数の宣言子から `VariableDeclaration` を作ります。
+    ///
+    /// 例
+    /// - `var a = 1, b;` → `declarations = [VarDecl(a=1), VarDecl(b=None)]`
+    ///
+    /// メモ
+    /// - 本来は `kind: 'var'|'let'|'const'` を持ちますが学習用のため省略しています。
+    pub fn new_variable_declaration(declarations: Vec<Option<Rc<Self>>>) -> Option<Rc<Self>> {
+        Some(Rc::new(Node::VariableDeclaration { declarations }))
+    }
+
+    /// `Identifier(name)` を作ります。変数名・関数名などの“名前”用ノード。
+    /// - 例: `new_identifier("result".into())`
+    pub fn new_identifier(name: String) -> Option<Rc<Self>> {
+        Some(Rc::new(Node::Identifier(name)))
+    }
+
+    /// `StringLiteral(value)` を作ります。二重引用符の中身だけを保持します。
+    /// - 例: 入力 `"bar"` → `new_string_literal("bar".into())`
+    pub fn new_string_literal(value: String) -> Option<Rc<Self>> {
+        Some(Rc::new(Node::StringLiteral(value)))
     }
 }
 
@@ -142,10 +201,8 @@ impl Program {
         Self { body: Vec::new() }
     }
 
-    /// 本文（文の並び）をまとめてセットする
-    ///
-    /// 注意
-    /// - 既存の `body` は置き換えられます。追記したい場合は呼び出し側で `push` してください。
+    /// 本文（文の並び）をまとめてセットします。
+    /// - 既存の `body` は置き換えます。追記したい場合は呼び出し側で `push` してください。
     pub fn set_body(&mut self, body: Vec<Rc<Node>>) {
         self.body = body;
     }
@@ -167,9 +224,15 @@ impl JsParser {
         Self { t: t.peekable() }
     }
 
-    /// Primary（最小単位の式）を読む。いまは数値のみ対応。
-    /// - `42` → `NumericLiteral(42)`
-    /// - それ以外は未対応のため `None`。
+    /// Primary（最小単位の式）を読みます。対応: 識別子 / 文字列 / 数値。
+    ///
+    /// 例
+    /// - 数値: `42` → `NumericLiteral(42)`
+    /// - 文字列: `"hi"` → `StringLiteral("hi")`
+    /// - 識別子: `foo` → `Identifier("foo")`
+    ///
+    /// 実装メモ
+    /// - `next()` で 1 トークン読み取り、種別に応じてノードを生成します。
     fn primary_expression(&mut self) -> Option<Rc<Node>> {
         let t = match self.t.next() {
             Some(token) => token,
@@ -177,24 +240,25 @@ impl JsParser {
         };
 
         match t {
+            Token::Identifier(value) => Node::new_identifier(value),
+            Token::StringLiteral(value) => Node::new_string_literal(value),
             Token::Number(value) => Node::new_numeric_literal(value),
             _ => None,
         }
     }
 
-    /// メンバ式。現状は Primary をそのまま返す（将来 `obj.prop` 等をここで扱う想定）。
+    /// メンバ式。
     fn member_expression(&mut self) -> Option<Rc<Node>> {
         self.primary_expression()
     }
 
-    /// 左辺値式。現状はメンバ式＝Primary と同義（将来 `a.b = 1` などで利用）。
+    /// 左辺値式。
     fn left_hand_side_expression(&mut self) -> Option<Rc<Node>> {
         self.member_expression()
     }
 
-    /// `+` / `-` を 1 回だけ見る簡易版の加算式。
-    /// - 入力: `1 + 2` → `AdditiveExpression('+', 1, 2)`
-    /// - 未対応: 連鎖（`1 + 2 + 3`）や優先順位、左結合の厳密性など。
+    /// `+` / `-` を扱う加算式。
+    /// - 例: `1 + 2` → `AdditiveExpression('+', 1, 2)`
     fn additive_expression(&mut self) -> Option<Rc<Node>> {
         // 足し算または引き算の左辺を作る
         let left = self.left_hand_side_expression();
@@ -218,18 +282,126 @@ impl JsParser {
         }
     }
 
-    /// 代入式の読み取り。現状は加算式にフォールバック（未実装の雛形）。
+    /// 代入式（`=`）を読みます。
+    ///
+    /// 仕様と実装ポイント
+    /// - まず加算式（`additive_expression`）を読み、これを左辺候補 `expr` とします。
+    /// - 次トークンを `peek()` し、`'='` なら 1 つ消費して右辺を“再帰的に” `assignment_expression()` で読みます。
+    ///   これにより `a = b = 1` のような式は右結合（`a = (b = 1)`）として扱われます。
+    /// - `=` でなければ、単なる加算式として `expr` を返します（代入ではない）。
     fn assignment_expression(&mut self) -> Option<Rc<Node>> {
-        self.additive_expression()
+        let expr = self.additive_expression();
+
+        let t = match self.t.peek() {
+            Some(token) => token,
+            None => return expr,
+        };
+
+        match t {
+            Token::Punctuator('=') => {
+                // '='を消費する
+                assert!(self.t.next().is_some());
+                Node::new_assignment_expression('=', expr, self.assignment_expression())
+            }
+            _ => expr,
+        }
     }
 
-    /// 文（Statement）を 1 つ読む。式文のみ対応。
-    /// - 末尾に `;` があれば消費（任意）。
+    /// 変数宣言子の“初期化子”部分（`= 式`）を読み取ります（任意）。
+    ///
+    /// 仕様（この簡易実装）
+    /// - 次の 1 トークンを読み、`'='` なら後続を `assignment_expression()` に委譲して返します。
+    /// - `'='` 以外なら初期化子なしとして `None` を返します。
+    ///
+    /// TS/Python イメージ
+    /// - TS: `init?: Expression`（`=` があれば存在、無ければ `undefined`）
+    /// - Python: `ast.Assign(..., value?)`（ここでは `value` の有無に相当）
+    fn initialiser(&mut self) -> Option<Rc<Node>> {
+        // 次のトークンを 1 つ取り出して、`=` かどうかを判定
+        let t = match self.t.next() {
+            Some(token) => token,
+            None => return None,
+        };
+
+        match t {
+            Token::Punctuator(c) => match c {
+                '=' => self.assignment_expression(), // `=` の後ろは代入式として読む
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// 次のトークンが識別子（Identifier）ならそれを `Node::Identifier` にして返します。
+    /// - 想定位置: 直前で `var` を読み終えた直後など。
+    /// - それ以外（数値や記号など）のトークンなら `None` を返します（学習用の簡易実装）。
+    fn identifier(&mut self) -> Option<Rc<Node>> {
+        let t = match self.t.next() {
+            Some(token) => token,
+            None => return None,
+        };
+
+        match t {
+            Token::Identifier(name) => Node::new_identifier(name),
+            _ => None,
+        }
+    }
+
+    /// 変数宣言（`var` の後ろ）を 1 件だけ読み取り、`VariableDeclaration` を作ります。
+    ///
+    /// 振る舞い
+    /// - まず識別子名を `identifier()` で読む（例: `var foo ...` の `foo`）。
+    /// - 続けて初期化子を `initialiser()` で読む想定（例: `= 42`）。なければ `None`。
+    /// - 1 つの `VariableDeclarator` を `declarations` ベクタに入れて `VariableDeclaration` を返す。
+    ///
+    /// 補足
+    /// - 文末の `;` は呼び出し側（`statement()`）で処理します。
+    ///
+    /// TS/Python のイメージ
+    /// - TS: `VariableDeclaration { declarations: [ { id, init? } ] }`
+    /// - Python: `ast.Assign(targets=[Name(id)], value?)` に相当（かなり簡略化）
+    fn variable_declaration(&mut self) -> Option<Rc<Node>> {
+        let ident = self.identifier();
+
+        let declarator = Node::new_variable_declarator(ident, self.initialiser());
+
+        let mut declarations = Vec::new();
+        declarations.push(declarator);
+
+        Node::new_variable_declaration(declarations)
+    }
+
+    /// 文（Statement）を 1 つ読み取って AST ノードにします。
+    ///
+    /// 対応（学習用の簡易版）
+    /// - 変数宣言: 先頭が `var` → `variable_declaration()` を呼んで `VariableDeclaration` を作る。
+    /// - 上記以外: それ以外は式文として `ExpressionStatement(assignment_expression)` にする。
+    ///
+    /// セミコロン
+    /// - 末尾に `;` があれば 1 つだけ消費（任意セミコロン）。
     fn statement(&mut self) -> Option<Rc<Node>> {
-        let node = Node::new_expression_statement(self.assignment_expression());
+        let t = match self.t.peek() {
+            Some(t) => t,
+            None => return None,
+        };
+
+        // 先頭トークンの種類で文の種別を判定
+        let node = match t {
+            Token::Keyword(keyword) => {
+                if keyword == "var" {
+                    // "var" を 1 つ消費してから、宣言の本体を読む
+                    assert!(self.t.next().is_some());
+
+                    self.variable_declaration()
+                } else {
+                    None
+                }
+            }
+            _ => Node::new_expression_statement(self.assignment_expression()),
+        };
 
         if let Some(Token::Punctuator(c)) = self.t.peek() {
-            // `;` を消費（あれば）
+            // 文末の `;` を 1 つだけ消費（任意）
             if c == &';' {
                 assert!(self.t.next().is_some());
             }
@@ -238,7 +410,7 @@ impl JsParser {
         node
     }
 
-    /// トップレベルの“要素”を読む。未対応の構文なら `None` を返す想定。
+    /// トップレベルの“要素”を読みます。トークンが無ければ `None` を返します。
     fn source_element(&mut self) -> Option<Rc<Node>> {
         match self.t.peek() {
             Some(t) => t,
@@ -276,11 +448,11 @@ impl JsParser {
 mod tests {
     use super::*;
     use alloc::string::ToString;
-    // このモジュールでは JS の“超最小”AST パーサの挙動を確認します。
-    // - 入口は `JsParser::parse_ast()`。戻り値は最上位ノード `Program`。
-    // - `Program.body` には文（Statement）が並びます。ここでは主に
-    //   `ExpressionStatement` とその中の式（数値リテラル / 加算式）を検証します。
-    // - TS/Python イメージ: `Program { body: Node[] }`、`ExpressionStatement { expression: Node }`。
+    // このモジュールでは AST パーサ `JsParser::parse_ast()` の出力形を確認します。
+    // - `Program.body` に文が順に入ることを前提に、各ケースのノード形状を比較します。
+    // - 検証対象: NumericLiteral / AdditiveExpression / VariableDeclaration / VariableDeclarator /
+    //             Identifier / StringLiteral など。
+    // - TS/Python イメージ: `Program { body: Node[] }` / `ast.Module(body=[...])`。
 
     #[test]
     fn test_empty() {
@@ -333,6 +505,59 @@ mod tests {
                 right: Some(Rc::new(Node::NumericLiteral(2))),
             },
         )))));
+        expected.set_body(body);
+        assert_eq!(expected, parser.parse_ast());
+    }
+
+    #[test]
+    fn test_assign_variable() {
+        // 変数宣言（文字列初期化）: var foo = "bar";
+        // - VariableDeclaration の中に 1 件の VariableDeclarator
+        // - id: Identifier("foo") / init: StringLiteral("bar")
+        let input = "var foo=\"bar\";".to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let mut expected = Program::new();
+        let mut body = Vec::new();
+        body.push(Rc::new(Node::VariableDeclaration {
+            declarations: [Some(Rc::new(Node::VariableDeclarator {
+                id: Some(Rc::new(Node::Identifier("foo".to_string()))),
+                init: Some(Rc::new(Node::StringLiteral("bar".to_string()))),
+            }))]
+            .to_vec(),
+        }));
+        expected.set_body(body);
+        assert_eq!(expected, parser.parse_ast());
+    }
+
+    #[test]
+    fn test_add_variable_and_num() {
+        // 2 文の連続: `var foo=42;` と `var result=foo+1;`
+        // - 1 文目: id=Identifier("foo"), init=NumericLiteral(42)
+        // - 2 文目: id=Identifier("result"), init=AdditiveExpression('+', Identifier("foo"), NumericLiteral(1))
+        let input = "var foo=42; var result=foo+1;".to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let mut expected = Program::new();
+        let mut body = Vec::new();
+        body.push(Rc::new(Node::VariableDeclaration {
+            declarations: [Some(Rc::new(Node::VariableDeclarator {
+                id: Some(Rc::new(Node::Identifier("foo".to_string()))),
+                init: Some(Rc::new(Node::NumericLiteral(42))),
+            }))]
+            .to_vec(),
+        }));
+        body.push(Rc::new(Node::VariableDeclaration {
+            declarations: [Some(Rc::new(Node::VariableDeclarator {
+                id: Some(Rc::new(Node::Identifier("result".to_string()))),
+                init: Some(Rc::new(Node::AdditiveExpression {
+                    operator: '+',
+                    left: Some(Rc::new(Node::Identifier("foo".to_string()))),
+                    right: Some(Rc::new(Node::NumericLiteral(1))),
+                })),
+            }))]
+            .to_vec(),
+        }));
         expected.set_body(body);
         assert_eq!(expected, parser.parse_ast());
     }
