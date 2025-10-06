@@ -92,6 +92,36 @@ pub enum Node {
 
     /// 文字列リテラル。二重引用符で囲まれた文字列の内容。例: `StringLiteral("bar")`
     StringLiteral(String),
+
+    /// ブロック文。波括弧 `{ ... }` 内の文の並びをまとめたコンテナ。
+    /// - 例: `{ var a = 1; a; }` → `BlockStatement { body: [VariableDeclaration(..), ExpressionStatement(..)] }`
+    /// - TS/Python: `BlockStatement` / 複数文の並び（関数本体など）。
+    BlockStatement { body: Vec<Option<Rc<Node>>> },
+
+    /// return 文。`return` に続く式（省略可）を `argument` に保持します。
+    /// - 例: `return 1;` → `ReturnStatement { argument: NumericLiteral(1) }`
+    /// - 例: `return;`   → `ReturnStatement { argument: None }`
+    ReturnStatement { argument: Option<Rc<Node>> },
+
+    /// 関数宣言。
+    /// - `id`: 関数名（Identifier）。
+    /// - `params`: 仮引数の並び（Identifier の列）。
+    /// - `body`: 本体ブロック（`BlockStatement`）。
+    /// 例: `function add(a, b) { return a + b; }`
+    FunctionDeclaration {
+        id: Option<Rc<Node>>,
+        params: Vec<Option<Rc<Node>>>,
+        body: Option<Rc<Node>>,
+    },
+
+    /// 関数呼び出し式。
+    /// - `callee`: 呼び出し先（例: `Identifier("foo")`）
+    /// - `arguments`: 実引数の並び（式の列）
+    /// 例: `foo(1, 2)` → `CallExpression { callee: Identifier("foo"), arguments: [1, 2] }`
+    CallExpression {
+        callee: Option<Rc<Node>>,
+        arguments: Vec<Option<Rc<Node>>>,
+    },
 }
 
 impl Node {
@@ -177,6 +207,44 @@ impl Node {
     pub fn new_string_literal(value: String) -> Option<Rc<Self>> {
         Some(Rc::new(Node::StringLiteral(value)))
     }
+
+    /// `{ ... }` のブロック文を作ります。
+    /// - 例: `{ var a = 1; a; }` → `new_block_statement(vec![VarDecl(..), Expr(..)])`
+    /// - TS/Python: `BlockStatement` / 複数文の並び
+    pub fn new_block_statement(body: Vec<Option<Rc<Self>>>) -> Option<Rc<Self>> {
+        Some(Rc::new(Node::BlockStatement { body }))
+    }
+
+    /// `return` 文を作ります。`argument` は戻り値の式（省略可）。
+    /// - 例: `return 1;` → `new_return_statement(NumericLiteral(1))`
+    /// - 例: `return;`   → `new_return_statement(None)`
+    pub fn new_return_statement(argument: Option<Rc<Self>>) -> Option<Rc<Self>> {
+        Some(Rc::new(Node::ReturnStatement { argument }))
+    }
+
+    /// 関数宣言を作ります。
+    /// - `id`: 関数名（Identifier）
+    /// - `params`: 仮引数の並び（Identifier の列）
+    /// - `body`: 本体ブロック（BlockStatement）
+    /// 例: `function add(a, b) { return a + b; }`
+    pub fn new_function_declaration(
+        id: Option<Rc<Self>>,
+        params: Vec<Option<Rc<Self>>>,
+        body: Option<Rc<Self>>,
+    ) -> Option<Rc<Self>> {
+        Some(Rc::new(Node::FunctionDeclaration { id, params, body }))
+    }
+
+    /// 関数呼び出し式を作ります。
+    /// - `callee`: 呼び出し先（例: Identifier("foo"))
+    /// - `arguments`: 実引数の並び
+    /// 例: `foo(1, 2)` → `new_call_expression(Identifier("foo"), vec![1, 2])`
+    pub fn new_call_expression(
+        callee: Option<Rc<Self>>,
+        arguments: Vec<Option<Rc<Self>>>,
+    ) -> Option<Rc<Self>> {
+        Some(Rc::new(Node::CallExpression { callee, arguments }))
+    }
 }
 
 /// JavaScript の最上位ノード（ESTree の `Program` 相当、初心者向け）
@@ -247,14 +315,101 @@ impl JsParser {
         }
     }
 
-    /// メンバ式。
+    /// メンバ式（プロパティアクセス）を読み取ります。
+    ///
+    /// 役割
+    /// - まず基底となる式（`Primary`）を読み、直後が `.` のときに `Identifier` をプロパティ名として
+    ///   取り出し、`MemberExpression { object, property }` を構築します。
+    ///
+    /// 例
+    /// - `foo.bar` → `MemberExpression { object: Identifier("foo"), property: Identifier("bar") }`
     fn member_expression(&mut self) -> Option<Rc<Node>> {
-        self.primary_expression()
+        // オブジェクト側（左側）の式を読む
+        let expr = self.primary_expression();
+
+        let t = match self.t.peek() {
+            Some(token) => token,
+            None => return expr,
+        };
+
+        match t {
+            Token::Punctuator(c) => {
+                if c == &'.' {
+                    // '.'を消費する
+                    assert!(self.t.next().is_some());
+                    // プロパティ名（識別子）を読み、MemberExpression を作る
+                    return Node::new_member_expression(expr, self.identifier());
+                }
+
+                expr
+            }
+            _ => expr,
+        }
+    }
+
+    /// 呼び出しの実引数を読み取り、式ノードの配列として返します。
+    ///
+    /// 形式
+    /// - `)` までを対象に、`,` 区切りで `assignment_expression()` を順に収集します。
+    /// 例: `(1, x+2)` → `[NumericLiteral(1), AdditiveExpression('+', Identifier("x"), NumericLiteral(2))]`
+    fn arguments(&mut self) -> Vec<Option<Rc<Node>>> {
+        let mut arguments = Vec::new();
+
+        loop {
+            // ')'に到達するまで、解釈した値を`arguments`ベクタに追加する
+            match self.t.peek() {
+                Some(t) => match t {
+                    Token::Punctuator(c) => {
+                        if c == &')' {
+                            // ')'を消費する
+                            assert!(self.t.next().is_some());
+                            return arguments;
+                        }
+                        if c == &',' {
+                            // ','を消費する
+                            assert!(self.t.next().is_some());
+                        }
+                    }
+                    _ => arguments.push(self.assignment_expression()),
+                },
+                None => return arguments,
+            }
+        }
     }
 
     /// 左辺値式。
+    ///
+    /// 役割
+    /// - `MemberExpression` を基に、直後に `(` が続く場合は関数呼び出しとして `CallExpression`
+    ///   を構築します。
+    /// - つまり簡略化すると: `LeftHandSide → Member | Call(Member, Arguments)`。
+    ///
+    /// 例
+    /// - `foo.bar(1, 2)` → `CallExpression { callee: MemberExpression(foo, bar), arguments: [1, 2] }`
     fn left_hand_side_expression(&mut self) -> Option<Rc<Node>> {
-        self.member_expression()
+        // まずメンバ式を読み、呼び出し対象（callee）の候補とする
+        let expr = self.member_expression();
+
+        let t = match self.t.peek() {
+            Some(token) => token,
+            None => return expr,
+        };
+
+        match t {
+            Token::Punctuator(c) => {
+                if c == &'(' {
+                    // '('を消費する
+                    assert!(self.t.next().is_some());
+                    // 関数呼び出しのため、CallExpressionノードを返す
+                    return Node::new_call_expression(expr, self.arguments());
+                }
+
+                // それ以外の記号なら、単なる MemberExpression として返す
+                expr
+            }
+            // 先頭が記号以外（識別子・数値など）の場合も、そのまま返す
+            _ => expr,
+        }
     }
 
     /// `+` / `-` を扱う加算式。
@@ -371,11 +526,12 @@ impl JsParser {
         Node::new_variable_declaration(declarations)
     }
 
-    /// 文（Statement）を 1 つ読み取って AST ノードにします。
+    /// 文（Statement）を 1 つ読み取り、対応する AST ノードを返します。
     ///
-    /// 対応（学習用の簡易版）
-    /// - 変数宣言: 先頭が `var` → `variable_declaration()` を呼んで `VariableDeclaration` を作る。
-    /// - 上記以外: それ以外は式文として `ExpressionStatement(assignment_expression)` にする。
+    /// 対応（簡易版）
+    /// - 変数宣言: 先頭が `var` → `variable_declaration()` を呼ぶ。
+    /// - return 文: 先頭が `return` → 後続の式（任意）を読み、`ReturnStatement` に包む。
+    /// - 式文: 上記以外は `ExpressionStatement(assignment_expression)` にする。
     ///
     /// セミコロン
     /// - 末尾に `;` があれば 1 つだけ消費（任意セミコロン）。
@@ -393,6 +549,11 @@ impl JsParser {
                     assert!(self.t.next().is_some());
 
                     self.variable_declaration()
+                } else if keyword == "return" {
+                    // "return"の予約語を消費する
+                    assert!(self.t.next().is_some());
+
+                    Node::new_return_statement(self.assignment_expression())
                 } else {
                     None
                 }
@@ -410,14 +571,131 @@ impl JsParser {
         node
     }
 
-    /// トップレベルの“要素”を読みます。トークンが無ければ `None` を返します。
+    /// 関数本体 `{ ... }` を読み取り、`BlockStatement` を返します。
+    ///
+    /// 手順
+    /// - 開き波括弧 `{` を 1 つ消費。
+    /// - `}` に達するまで、`source_element()` を使って文/宣言を順に読み、`body` に蓄える。
+    /// - 閉じ波括弧 `}` を消費して、`new_block_statement(body)` を返す。
+    fn function_body(&mut self) -> Option<Rc<Node>> {
+        // '{'を消費する
+        match self.t.next() {
+            Some(t) => match t {
+                Token::Punctuator(c) => assert!(c == '{'),
+                _ => unimplemented!("function should have open curly blacket but got {:?}", t),
+            },
+            None => unimplemented!("function should have open curly blacket but got None"),
+        }
+
+        let mut body = Vec::new(); // 本体の文をここに集める
+        loop {
+            // '}'に到達するまで、関数内のコードとして解釈する
+            match self.t.peek() {
+                Some(t) => match t {
+                    Token::Punctuator(c) => {
+                        if c == &'}' {
+                            // '}'を消費し、BlockStatementノードを返す
+                            assert!(self.t.next().is_some());
+                            return Node::new_block_statement(body);
+                        }
+                    }
+                    _ => {}
+                },
+                None => {}
+            }
+
+            // 関数内の文・宣言を 1 つ読み取り、`body` に追加
+            body.push(self.source_element());
+        }
+    }
+
+    /// 仮引数リストを読み取り、識別子ノードの配列として返します。
+    ///
+    /// 形式
+    /// - `(` identifier (`,` identifier)* `)`
+    /// 例: `(a, b, c)` → `[Identifier("a"), Identifier("b"), Identifier("c")]`
+    fn parameter_list(&mut self) -> Vec<Option<Rc<Node>>> {
+        let mut params = Vec::new();
+
+        // 1) 開き括弧 `(` を 1 つ消費
+        match self.t.next() {
+            Some(t) => match t {
+                Token::Punctuator(c) => assert!(c == '('),
+                _ => unimplemented!("function should have `(` but got {:?}", t),
+            },
+            None => unimplemented!("function should have `(` but got None"),
+        }
+
+        // 2) `)` に出会うまで、`,` 区切りで識別子を読み続ける
+        loop {
+            match self.t.peek() {
+                Some(t) => match t {
+                    Token::Punctuator(c) => {
+                        if c == &')' {
+                            // 閉じ括弧 `)` を消費して終了
+                            assert!(self.t.next().is_some());
+                            return params;
+                        }
+                        if c == &',' {
+                            // 区切りカンマを 1 つ消費して次の識別子へ
+                            assert!(self.t.next().is_some());
+                        }
+                    }
+                    _ => {
+                        // 識別子を 1 つ読み、パラメータ配列に追加
+                        params.push(self.identifier());
+                    }
+                },
+                None => return params,
+            }
+        }
+    }
+
+    /// 関数宣言を読み取り、`FunctionDeclaration` ノードを作ります。
+    ///
+    /// 前提
+    /// - 直前で `function` キーワードは消費済み（`source_element` 側で処理）。
+    ///
+    /// 手順
+    /// 1) 関数名を `identifier()` で読む（例: `function foo(...)` の `foo`）。
+    /// 2) 仮引数リストを `parameter_list()` で読む（丸括弧内の識別子の並び）。
+    /// 3) 本体ブロックを `function_body()` で読む（`{ ... }`）。
+    /// 4) 以上を `new_function_declaration(..)` で 1 つのノードにまとめて返す。
+    fn function_declaration(&mut self) -> Option<Rc<Node>> {
+        // 1) 関数名
+        let id = self.identifier();
+        // 2) 引数一覧
+        let params = self.parameter_list();
+        // 3) 本体ブロックを読み、ノードを構築
+        Node::new_function_declaration(id, params, self.function_body())
+    }
+
+    /// トップレベル要素を読み取ります（関数宣言または通常の文）。
+    ///
+    /// 流れ
+    /// - 先頭トークンを `peek()`。
+    /// - `function` キーワードなら 1 つ消費して `function_declaration()` を呼ぶ。
+    /// - それ以外は `statement()` に委譲。
+    /// - トークンが無ければ `None`。
     fn source_element(&mut self) -> Option<Rc<Node>> {
-        match self.t.peek() {
+        let t = match self.t.peek() {
             Some(t) => t,
             None => return None,
         };
 
-        self.statement()
+        match t {
+            Token::Keyword(keyword) => {
+                if keyword == "function" {
+                    // 先頭が `function` のとき、キーワードを 1 つ消費してから関数宣言を読む
+                    assert!(self.t.next().is_some());
+                    self.function_declaration()
+                } else {
+                    // `function` 以外のキーワード（例: var, return など）は文として扱う
+                    self.statement()
+                }
+            }
+            _ => self.statement(), // キーワード以外も文として扱う
+        }
     }
 
     /// 入力全体を走査して `Program` を作るメイン関数。
@@ -557,6 +835,109 @@ mod tests {
                 })),
             }))]
             .to_vec(),
+        }));
+        expected.set_body(body);
+        assert_eq!(expected, parser.parse_ast());
+    }
+
+    #[test]
+    fn test_define_function() {
+        // 関数宣言のみ: function foo() { return 42; }
+        // 期待:
+        // - Program.body = [ FunctionDeclaration ]
+        // - FunctionDeclaration.id = Identifier("foo")
+        // - params = []（引数なし）
+        // - body = BlockStatement { body: [ ReturnStatement(NumericLiteral(42)) ] }
+        let input = "function foo() { return 42; }".to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let mut expected = Program::new();
+        let mut body = Vec::new();
+        body.push(Rc::new(Node::FunctionDeclaration {
+            id: Some(Rc::new(Node::Identifier("foo".to_string()))),
+            params: [].to_vec(),
+            body: Some(Rc::new(Node::BlockStatement {
+                body: [Some(Rc::new(Node::ReturnStatement {
+                    argument: Some(Rc::new(Node::NumericLiteral(42))),
+                }))]
+                .to_vec(),
+            })),
+        }));
+        expected.set_body(body);
+        assert_eq!(expected, parser.parse_ast());
+    }
+
+    #[test]
+    fn test_add_function_add_num() {
+        // 関数宣言 + 変数宣言（関数呼び出し + 加算）
+        // 入力: function foo() { return 42; } var result = foo() + 1;
+        // 期待:
+        // - Program.body[0] は上と同じ FunctionDeclaration(foo)
+        // - Program.body[1] は VariableDeclaration:
+        //   - id = Identifier("result")
+        //   - init = AdditiveExpression('+', CallExpression(callee=Identifier("foo"), arguments=[]), NumericLiteral(1))
+        let input = "function foo() { return 42; } var result = foo() + 1;".to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let mut expected = Program::new();
+        let mut body = Vec::new();
+        body.push(Rc::new(Node::FunctionDeclaration {
+            id: Some(Rc::new(Node::Identifier("foo".to_string()))),
+            params: [].to_vec(),
+            body: Some(Rc::new(Node::BlockStatement {
+                body: [Some(Rc::new(Node::ReturnStatement {
+                    argument: Some(Rc::new(Node::NumericLiteral(42))),
+                }))]
+                .to_vec(),
+            })),
+        }));
+        body.push(Rc::new(Node::VariableDeclaration {
+            declarations: [Some(Rc::new(Node::VariableDeclarator {
+                id: Some(Rc::new(Node::Identifier("result".to_string()))),
+                init: Some(Rc::new(Node::AdditiveExpression {
+                    operator: '+',
+                    left: Some(Rc::new(Node::CallExpression {
+                        callee: Some(Rc::new(Node::Identifier("foo".to_string()))),
+                        arguments: [].to_vec(),
+                    })),
+                    right: Some(Rc::new(Node::NumericLiteral(1))),
+                })),
+            }))]
+            .to_vec(),
+        }));
+        expected.set_body(body);
+        assert_eq!(expected, parser.parse_ast());
+    }
+
+    #[test]
+    fn test_define_function_with_args() {
+        // 引数ありの関数宣言: function foo(a, b) { return a + b; }
+        // 期待:
+        // - FunctionDeclaration.id = Identifier("foo")
+        // - params = [Identifier("a"), Identifier("b")]
+        // - body = BlockStatement { body: [ ReturnStatement(AdditiveExpression('+', Identifier("a"), Identifier("b"))) ] }
+        let input = "function foo(a, b) { return a+b; }".to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let mut expected = Program::new();
+        let mut body = Vec::new();
+        body.push(Rc::new(Node::FunctionDeclaration {
+            id: Some(Rc::new(Node::Identifier("foo".to_string()))),
+            params: [
+                Some(Rc::new(Node::Identifier("a".to_string()))),
+                Some(Rc::new(Node::Identifier("b".to_string()))),
+            ]
+            .to_vec(),
+            body: Some(Rc::new(Node::BlockStatement {
+                body: [Some(Rc::new(Node::ReturnStatement {
+                    argument: Some(Rc::new(Node::AdditiveExpression {
+                        operator: '+',
+                        left: Some(Rc::new(Node::Identifier("a".to_string()))),
+                        right: Some(Rc::new(Node::Identifier("b".to_string()))),
+                    })),
+                }))]
+                .to_vec(),
+            })),
         }));
         expected.set_body(body);
         assert_eq!(expected, parser.parse_ast());

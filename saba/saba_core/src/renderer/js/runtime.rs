@@ -89,6 +89,32 @@ impl Display for RuntimeValue {
     }
 }
 
+/// 登録済みの関数（関数テーブルの 1 エントリ）
+///
+/// 役割
+/// - `function foo(a, b) { ... }` の情報を保持します。
+/// - ランタイムはここに溜めた関数を、`CallExpression` の評価時に名前で検索して実行します。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Function {
+    /// 関数名（例: "foo"）
+    id: String,
+    /// 仮引数（識別子ノードの列）。TS なら `Identifier[]` のイメージ。
+    params: Vec<Option<Rc<Node>>>,
+    /// 本体（`BlockStatement` ノード）。
+    body: Option<Rc<Node>>,
+}
+
+impl Function {
+    /// 関数エントリを作成します。
+    ///
+    /// 例
+    /// - `function add(a, b) { return a + b; }` →
+    ///   `Function::new("add".into(), vec![Identifier("a"), Identifier("b")], Some(BlockStatement{...}))`
+    fn new(id: String, params: Vec<Option<Rc<Node>>>, body: Option<Rc<Node>>) -> Self {
+        Self { id, params, body }
+    }
+}
+
 /// 実行環境（Environment）
 ///
 /// 役割
@@ -150,12 +176,14 @@ impl Environment {
 
 #[derive(Debug, Clone)]
 pub struct JsRuntime {
+    functions: Vec<Function>,
     env: Rc<RefCell<Environment>>,
 }
 
 impl JsRuntime {
     pub fn new() -> Self {
         Self {
+            functions: Vec::new(),
             env: Rc::new(RefCell::new(Environment::new(None))),
         }
     }
@@ -252,6 +280,71 @@ impl JsRuntime {
                 }
             }
             Node::StringLiteral(value) => Some(RuntimeValue::StringLiteral(value.to_string())),
+            // ブロック: 中の文を順に評価し、最後に評価した値を返す
+            Node::BlockStatement { body } => {
+                let mut result: Option<RuntimeValue> = None;
+                for stmt in body {
+                    result = self.eval(&stmt, env.clone());
+                }
+                result
+            }
+            // return 文: 引数の式を評価し、その値をそのまま返す
+            Node::ReturnStatement { argument } => {
+                return self.eval(&argument, env.clone());
+            }
+            // 関数宣言: 関数名・引数リスト・本体を Function として登録（実行はしない）
+            Node::FunctionDeclaration { id, params, body } => {
+                if let Some(RuntimeValue::StringLiteral(id)) = self.eval(&id, env.clone()) {
+                    // 本体は Rc<Node> を clone して保持（後で呼び出し時に評価）
+                    let cloned_body = match body {
+                        Some(b) => Some(b.clone()),
+                        None => None,
+                    };
+                    self.functions
+                        .push(Function::new(id, params.to_vec(), cloned_body));
+                };
+                None
+            }
+            Node::CallExpression { callee, arguments } => {
+                // 呼び出しごとに新しいスコープ（環境）を作成し、外側に現在の env をリンク
+                let new_env = Rc::new(RefCell::new(Environment::new(Some(env))));
+
+                let callee_value = match self.eval(callee, new_env.clone()) {
+                    Some(value) => value,
+                    None => return None,
+                };
+
+                // 事前に登録された関数群から、名前が一致するものを探す
+                let function = {
+                    let mut f: Option<Function> = None;
+
+                    for func in &self.functions {
+                        if callee_value == RuntimeValue::StringLiteral(func.id.to_string()) {
+                            f = Some(func.clone());
+                        }
+                    }
+
+                    match f {
+                        Some(f) => f,
+                        None => panic!("function {:?} doesn't exist", callee),
+                    }
+                };
+
+                // 実引数を、新スコープのローカル変数としてパラメータ名に束縛
+                assert!(arguments.len() == function.params.len());
+                for (i, item) in arguments.iter().enumerate() {
+                    if let Some(RuntimeValue::StringLiteral(name)) =
+                        self.eval(&function.params[i], new_env.clone())
+                    {
+                        new_env
+                            .borrow_mut()
+                            .add_variable(name, self.eval(item, new_env.clone()));
+                    }
+                }
+
+                // 関数本体を新しいスコープで評価して返す
+                self.eval(&function.body.clone(), new_env.clone())
+            }
         }
     }
 
@@ -382,6 +475,73 @@ mod tests {
         let ast = parser.parse_ast();
         let mut runtime = JsRuntime::new();
         let expected = [None, None, Some(RuntimeValue::Number(1))];
+        let mut i = 0;
+
+        for node in ast.body() {
+            let result = runtime.eval(&Some(node.clone()), runtime.env.clone());
+            assert_eq!(expected[i], result);
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn test_add_function_and_num() {
+        // 関数定義 + 呼び出し + 加算
+        // 入力: function foo() { return 42; } foo() + 1
+        // 期待: [None, Some(Number(43))]
+        // - 1 文目: 関数宣言（副作用のみ）
+        // - 2 文目: 呼び出し foo() が 42 を返し、42 + 1 → 43
+        let input = "function foo() { return 42; } foo()+1".to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new();
+        let expected = [None, Some(RuntimeValue::Number(43))];
+        let mut i = 0;
+
+        for node in ast.body() {
+            let result = runtime.eval(&Some(node.clone()), runtime.env.clone());
+            assert_eq!(expected[i], result);
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn test_define_function_with_args() {
+        // 引数付き関数の呼び出しと加算
+        // 入力: function foo(a, b) { return a + b; } foo(1, 2) + 3;
+        // 期待: [None, Some(Number(6))]
+        // - 1 文目: 関数宣言（副作用のみ）
+        // - 2 文目: foo(1, 2) が 3 を返し、3 + 3 → 6
+        let input = "function foo(a, b) { return a + b; } foo(1, 2) + 3;".to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new();
+        let expected = [None, Some(RuntimeValue::Number(6))];
+        let mut i = 0;
+
+        for node in ast.body() {
+            let result = runtime.eval(&Some(node.clone()), runtime.env.clone());
+            assert_eq!(expected[i], result);
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn test_local_variable() {
+        // ローカル変数とグローバル変数のスコープ確認
+        // 入力: var a=42; function foo() { var a=1; return a; } foo() + a
+        // 期待: [None, None, Some(Number(43))]
+        // - 1 文目: グローバル a=42 を束縛
+        // - 2 文目: 関数宣言（関数内にローカル a=1）
+        // - 3 文目: foo() は 1 を返し、1 + 42 → 43（スコープの区別）
+        let input = "var a=42; function foo() { var a=1; return a; } foo()+a".to_string();
+        let lexer = JsLexer::new(input);
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+        let mut runtime = JsRuntime::new();
+        let expected = [None, None, Some(RuntimeValue::Number(43))];
         let mut i = 0;
 
         for node in ast.body() {
