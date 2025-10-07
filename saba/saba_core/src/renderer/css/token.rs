@@ -84,6 +84,10 @@ impl CssTokenizer {
     // 再びダブルクオーテーションまたはシングルクォーテーションが現れるまで入力を文字として解釈する
     /// https://www.w3.org/TR/css-syntax-3/#consume-a-string-token
     /// 例: `"Helvetica"` → `"Helvetica"`（両端の引用は除いた内容を返す）
+    /// ポインタの動き（概念図）
+    /// - 先頭の引用 `"` 上で呼ばれる → ループ先頭で `pos += 1` して中身を 1 文字ずつ読む
+    /// - 終端の引用 `"` に当たったら break → 呼び出し側の `next()` で最後に `pos += 1` して
+    ///   “閉じ引用の次” に進む
     /// 注意: この簡易実装では `\"` などのエスケープや改行・EOF の扱いを省略しています。
     fn consume_string_token(&mut self) -> String {
         let mut s = String::new();
@@ -109,6 +113,11 @@ impl CssTokenizer {
     /// https://www.w3.org/TR/css-syntax-3/#consume-number
     /// https://www.w3.org/TR/css-syntax-3/#consume-a-numeric-token
     /// 例: `12.34` → 12.34
+    /// 実装メモ
+    /// - `floating` が true になると、小数点以下の重み `floating_digit` を 1/10, 1/100, ... と下げながら
+    ///   桁を加算していきます。
+    /// - 読み進めはこの関数内で行い、呼び出し側（`next()`）では帳尻合わせの `self.pos -= 1` を行います
+    ///   （`next()` の末尾で一律 `pos += 1` する設計のため）。
     /// 注意: `.5` のような先頭ドット数値や指数表記 `1e3` は未対応です。
     fn consume_numeric_token(&mut self) -> f64 {
         let mut num = 0f64;
@@ -172,6 +181,10 @@ impl Iterator for CssTokenizer {
     type Item = CssToken;
 
     /// https://www.w3.org/TR/css-syntax-3/#consume-token
+    /// 実装のポイント
+    /// - 空白・改行は“トークン化せず”に読み飛ばします。
+    /// - `consume_*` を呼んだ場合は内部で `pos` を進めるため、末尾で一律 `pos += 1` する前に
+    ///   1 文字ぶん戻す（`self.pos -= 1`）箇所があります。
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             // 0) 入力末尾ならイテレータ終了（None）。
@@ -218,6 +231,8 @@ impl Iterator for CssTokenizer {
                 // #ID or 色コード風（本実装では単純化して識別子の連結）
                 '#' => {
                     // 簡易版: 常に `#` に続く識別子を HashToken とする。
+                    // 注意: 厳密には `#` 後ろは name ルールに従うべきですが、ここでは `#id` や
+                    // `#fff` のようなケースを広く受けるため、`#` を含めて 1 つの識別子として読みます。
                     let value = self.consume_ident_token();
                     self.pos -= 1;
                     CssToken::HashToken(value)
