@@ -31,12 +31,16 @@ use crate::http::HttpResponse;
 use crate::renderer::css::cssom::CssParser;
 use crate::renderer::css::cssom::StyleSheet;
 use crate::renderer::css::token::CssTokenizer;
+use crate::renderer::dom::api::get_js_content;
 use crate::renderer::dom::api::get_style_content;
 use crate::renderer::dom::node::ElementKind;
 use crate::renderer::dom::node::NodeKind;
 use crate::renderer::dom::node::Window;
 use crate::renderer::html::parser::HtmlParser;
 use crate::renderer::html::token::HtmlTokenizer;
+use crate::renderer::js::ast::JsParser;
+use crate::renderer::js::runtime::JsRuntime;
+use crate::renderer::js::token::JsLexer;
 use crate::renderer::layout::layout_view::LayoutView;
 use alloc::rc::Rc;
 use alloc::rc::Weak;
@@ -102,12 +106,44 @@ impl Page {
         self.browser = browser;
     }
 
-    // ネットワーク応答（HTMLを含む）を受け取り、DOM/CSSOM→レイアウト→描画命令まで進める
-    // フロー: create_frame(HTML→DOM/CSSOM) → set_layout_view(DOM+CSSOM→Layout) → paint_tree(Layout→DisplayItem)
+    // ネットワーク応答（HTML）を受け取り、DOM/CSSOM 構築 → JS 実行 → レイアウト → 描画命令 まで進める
+    // フロー:
+    // - create_frame: HTML→DOM、<style>→CSSOM を作成
+    // - execute_js:   <script> を評価（DOM/属性の変更など副作用を反映）
+    // - set_layout_view: 変化後の DOM + CSSOM からレイアウトツリーを構築
+    // - paint_tree:   レイアウトツリーから DisplayItem（描画命令）を生成
     pub fn receive_response(&mut self, response: HttpResponse) {
         self.create_frame(response.body());
+        self.execute_js();
         self.set_layout_view();
         self.paint_tree();
+    }
+
+    /// ページ内の `<script>` を取り出して実行する（超最小 JS ランタイム連携）
+    ///
+    /// 処理の流れ
+    /// - DOM から `<script>` のテキストを抽出（`get_js_content`）。
+    /// - JS を字句解析（`JsLexer`）→ 構文解析（`JsParser`）して AST を作る。
+    /// - JS ランタイム（`JsRuntime`）を用意し、AST を評価して副作用（変数/DOM 変更）を反映。
+    fn execute_js(&mut self) {
+        // 1) DOM ルート（Document）を取得。ページが未構築なら何もしない
+        let dom = match &self.frame {
+            Some(frame) => frame.borrow().document(),
+            None => return,
+        };
+
+        // 2) `<script>` の中身を抽出して、JS のソース文字列を得る
+        let js = get_js_content(dom.clone());
+        let lexer = JsLexer::new(js);
+
+        // 3) JS をパースして AST を構築
+        let mut parser = JsParser::new(lexer);
+        let ast = parser.parse_ast();
+
+        // 4) ランタイムを用意して AST を実行
+        //    補足: DOM 連携（document.getElementById 等）のために DOM 参照を渡します。
+        let mut runtime = JsRuntime::new(dom);
+        runtime.execute(&ast);
     }
 
     // HTML 文字列から DOM（Window/Document）と CSSOM（StyleSheet）を作る
